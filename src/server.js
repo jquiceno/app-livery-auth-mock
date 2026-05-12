@@ -92,7 +92,7 @@ app.use(express.json())
 const startedAt = Date.now()
 
 app.get('/', (_req, res) => {
-  res.json({ service: 'tmv-mock-auth', ok: true, startedAt })
+  res.json({ service: 'tmv-mock-auth', ok: true, startedAt: new Date(startedAt).toISOString() })
 })
 
 /** Registra un cliente (company) y genera un nuevo kid (rotación = llamar de nuevo con mismo companyId añade clave). */
