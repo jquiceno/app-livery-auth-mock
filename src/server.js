@@ -1,16 +1,24 @@
 /**
- * Mock OIDC / JWKS + emisor de JWT (EdDSA / Ed25519) alineado con tmv-proposal.md §3.
- * Almacenamiento en memoria; URLs públicas derivadas del Host de la petición.
+ * Simulador OEM OIDC: discovery/JWKS mínimos + JWT EdDSA (Ed25519).
+ * Contrato: OEM OIDC Simulator (Applivery) + tmv-proposal §3 donde aplica.
  */
 import express from 'express'
 import { generateKeyPair, exportJWK, SignJWT } from 'jose'
 import { randomUUID } from 'node:crypto'
 
 const PORT = Number(process.env.PORT ?? 3847)
-/** Si se define, sustituye protocolo/host para iss / jwks_uri en JSON (útil detrás de proxy). */
-const MOCK_PUBLIC_URL = (
-  process.env.MOCK_PUBLIC_URL ?? ''
-).replace(/\/$/, '')
+
+/** Audiencia para POST /admin/organizations/oem-bootstrap (valor que entrega Applivery). */
+const OEM_PLATFORM_SERVICE_ACCOUNT_ID = process.env.OEM_PLATFORM_SERVICE_ACCOUNT_ID ?? ''
+
+const MOCK_PUBLIC_URL = (process.env.MOCK_PUBLIC_URL ?? '').replace(/\/$/, '')
+
+/** TTL máximo del contrato (segundos). */
+const MAX_TOKEN_TTL_SEC = 300
+
+/** kid por defecto para firmar el JWT de bootstrap (clave workspace en JWKS tenant). */
+const BOOTSTRAP_TENANT_KID =
+  process.env.OEM_BOOTSTRAP_TENANT_KID ?? 'tmv-tenant-workspace-2026-04'
 
 /**
  * @typedef {{ privateKey: CryptoKey, publicKey: CryptoKey, kid: string, companyId: string }} CustomerKey
@@ -20,7 +28,6 @@ const MOCK_PUBLIC_URL = (
 /** @type {Map<string, CustomerKey[]>} */
 const customerKeys = new Map()
 
-/** kid -> TenantScopeKey */
 /** @type {Map<string, TenantScopeKey>} */
 const tenantKeysByKid = new Map()
 
@@ -49,6 +56,13 @@ const TENANT_SCOPE_DEFS = [
   },
 ]
 
+function clampTtl(seconds) {
+  const n = Number(seconds)
+  const fallback = MAX_TOKEN_TTL_SEC
+  const v = Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback
+  return Math.min(v, MAX_TOKEN_TTL_SEC)
+}
+
 async function keyPairToJwksEntry(publicKey, kid) {
   const jwk = await exportJWK(publicKey)
   return {
@@ -66,9 +80,6 @@ function publicBaseUrl(req) {
   return `${proto}://${host}`
 }
 
-/**
- * Genera un par Ed25519 (EdDSA) — algoritmo recomendado en la propuesta §3.3 / §3.7.
- */
 async function createEd25519Pair() {
   return generateKeyPair('EdDSA', { crv: 'Ed25519', extractable: true })
 }
@@ -92,10 +103,20 @@ app.use(express.json())
 const startedAt = Date.now()
 
 app.get('/', (_req, res) => {
-  res.json({ service: 'tmv-mock-auth', ok: true, startedAt: new Date(startedAt).toISOString() })
+  res.json({
+    service: 'oem-oidc-simulator',
+    ok: true,
+    startedAt: new Date(startedAt).toISOString(),
+    maxTokenTtlSeconds: MAX_TOKEN_TTL_SEC,
+    bootstrapTenantKid: BOOTSTRAP_TENANT_KID,
+    platformServiceAccountIdConfigured: Boolean(OEM_PLATFORM_SERVICE_ACCOUNT_ID),
+    hint:
+      !OEM_PLATFORM_SERVICE_ACCOUNT_ID &&
+      'Definir OEM_PLATFORM_SERVICE_ACCOUNT_ID con el valor de Applivery para /api/tokens/bootstrap',
+  })
 })
 
-/** Registra un cliente (company) y genera un nuevo kid (rotación = llamar de nuevo con mismo companyId añade clave). */
+/** Registra claves del emisor workspace: iss = …/oem/{companyId} (debe coincidir con workspaceIssuer del bootstrap). */
 app.post('/api/customers/:companyId/keys', async (req, res) => {
   const { companyId } = req.params
   if (!companyId?.length) {
@@ -117,7 +138,6 @@ app.post('/api/customers/:companyId/keys', async (req, res) => {
   })
 })
 
-/** Lista claves públicas por company (sin materiales privados). */
 app.get('/api/customers/:companyId', (req, res) => {
   const list = customerKeys.get(req.params.companyId)
   if (!list?.length) {
@@ -132,20 +152,16 @@ app.get('/api/customers/:companyId', (req, res) => {
   })
 })
 
-/** Tenant-level OIDC discovery — §3.5 (antes de /oem/:companyId para no capturar ".well-known" como id). */
+/** Emisor raíz / tenant — discovery mínimo (contrato OEM OIDC Simulator). */
 app.get('/oem/.well-known/openid-configuration', (req, res) => {
   const base = publicBaseUrl(req)
   const issuer = `${base}/oem`
   res.json({
     issuer,
     jwks_uri: `${issuer}/.well-known/jwks.json`,
-    id_token_signing_alg_values_supported: ['EdDSA'],
-    subject_types_supported: ['public'],
-    response_types_supported: ['id_token'],
   })
 })
 
-/** Tenant-level JWKS (todos los scopes ilustrativos) */
 app.get('/oem/.well-known/jwks.json', async (_req, res) => {
   const keys = await Promise.all(
     [...tenantKeysByKid.values()].map((k) => keyPairToJwksEntry(k.publicKey, k.kid))
@@ -153,7 +169,7 @@ app.get('/oem/.well-known/jwks.json', async (_req, res) => {
   res.json({ keys })
 })
 
-/** Per-customer OIDC discovery — §3.4 */
+/** Emisor por workspace/company — discovery mínimo. */
 app.get('/oem/:companyId/.well-known/openid-configuration', (req, res) => {
   const { companyId } = req.params
   const base = publicBaseUrl(req)
@@ -161,13 +177,9 @@ app.get('/oem/:companyId/.well-known/openid-configuration', (req, res) => {
   res.json({
     issuer,
     jwks_uri: `${issuer}/.well-known/jwks.json`,
-    id_token_signing_alg_values_supported: ['EdDSA'],
-    subject_types_supported: ['public'],
-    response_types_supported: ['id_token'],
   })
 })
 
-/** Per-customer JWKS */
 app.get('/oem/:companyId/.well-known/jwks.json', async (req, res) => {
   const list = customerKeys.get(req.params.companyId)
   if (!list?.length) {
@@ -179,9 +191,8 @@ app.get('/oem/:companyId/.well-known/jwks.json', async (req, res) => {
 })
 
 /**
- * JWT por cliente (workspace) — §3.3
- * Body: { wid, uid, sub?, aud?, expiresInSec?, kid? }
- * Si kid se omite, usa la última clave generada para ese companyId.
+ * JWT workspace (operador / owner) para llamadas Applivery /v1 con ese issuer.
+ * Claims: iss, aud, sub, wid, uid, iat, exp, jti — contrato + reglas importante.
  */
 app.post('/api/tokens/customer', async (req, res) => {
   const {
@@ -190,7 +201,7 @@ app.post('/api/tokens/customer', async (req, res) => {
     uid,
     sub,
     aud = DEFAULT_AUD_CUSTOMER,
-    expiresInSec = 300,
+    expiresInSec = MAX_TOKEN_TTL_SEC,
     kid: kidRequested,
   } = req.body ?? {}
 
@@ -205,7 +216,7 @@ app.post('/api/tokens/customer', async (req, res) => {
     return
   }
 
-  let entry = kidRequested
+  const entry = kidRequested
     ? list.find((k) => k.kid === kidRequested)
     : list[list.length - 1]
 
@@ -214,8 +225,10 @@ app.post('/api/tokens/customer', async (req, res) => {
     return
   }
 
+  const ttl = clampTtl(expiresInSec)
   const base = publicBaseUrl(req)
   const iss = `${base}/oem/${encodeURIComponent(companyId)}`
+
   const jwt = await new SignJWT({
     wid,
     uid,
@@ -226,25 +239,78 @@ app.post('/api/tokens/customer', async (req, res) => {
     .setAudience(aud)
     .setSubject(sub ?? uid)
     .setIssuedAt()
-    .setExpirationTime(`${Math.min(Math.max(Number(expiresInSec) || 300, 60), 3600)} sec`)
+    .setExpirationTime(`${ttl} sec`)
     .sign(entry.privateKey)
 
   res.json({
     token_type: 'Bearer',
     access_token: jwt,
-    expires_in: Math.min(Math.max(Number(expiresInSec) || 300, 60), 3600),
+    expires_in: ttl,
     header: { alg: 'EdDSA', kid: entry.kid, typ: 'JWT' },
+    expected_issuer: iss,
+    note:
+      'En Applivery, wid debe coincidir con el organizationId de la URL; iss con workspaceIssuer guardado.',
   })
 })
 
 /**
- * JWT tenant-admin — §3.5
- * Body: { kid, sub?, expiresInSec? }  (aud y scope salen del registro interno para ese kid)
+ * JWT de bootstrap (POST /admin/organizations/oem-bootstrap en Applivery).
+ * Claims estrictos: iss, aud, sub, iat, exp, jti — sin scope.
+ */
+app.post('/api/tokens/bootstrap', async (req, res) => {
+  const aud = req.body?.aud ?? OEM_PLATFORM_SERVICE_ACCOUNT_ID
+  if (!aud) {
+    res.status(400).json({
+      error:
+        'aud obligatorio: configura OEM_PLATFORM_SERVICE_ACCOUNT_ID o envía {"aud":"<platformServiceAccountId>"}',
+    })
+    return
+  }
+
+  const kidRequested = req.body?.kid ?? BOOTSTRAP_TENANT_KID
+  const entry = tenantKeysByKid.get(kidRequested)
+  if (!entry) {
+    res.status(404).json({
+      error: `kid tenant no encontrado: ${kidRequested}`,
+      availableKids: [...tenantKeysByKid.keys()],
+    })
+    return
+  }
+
+  const sub = req.body?.sub ?? 'tmv-uem-simulator-admin'
+  const ttl = clampTtl(req.body?.expiresInSec)
+
+  const base = publicBaseUrl(req)
+  const iss = `${base}/oem`
+
+  const jwt = await new SignJWT({})
+    .setProtectedHeader({ alg: 'EdDSA', kid: entry.kid, typ: 'JWT' })
+    .setIssuer(iss)
+    .setAudience(aud)
+    .setSubject(sub)
+    .setJti(randomUUID())
+    .setIssuedAt()
+    .setExpirationTime(`${ttl} sec`)
+    .sign(entry.privateKey)
+
+  res.json({
+    token_type: 'Bearer',
+    access_token: jwt,
+    expires_in: ttl,
+    header: { alg: 'EdDSA', kid: entry.kid, typ: 'JWT' },
+    issuer: iss,
+    aud,
+  })
+})
+
+/**
+ * JWT tenant con claim scope (solo desarrollo / propuesta TMV §3.5 ilustrativa).
+ * Para bootstrap usa /api/tokens/bootstrap.
  */
 app.post('/api/tokens/tenant', async (req, res) => {
-  const { kid, sub = 'tmv-uem-tenant-ops', expiresInSec = 300 } = req.body ?? {}
+  const { kid, sub = 'tmv-uem-tenant-ops', expiresInSec = MAX_TOKEN_TTL_SEC } = req.body ?? {}
   if (!kid) {
-    res.status(400).json({ error: 'kid es obligatorio (uno de TENANT_SCOPE_DEFS)' })
+    res.status(400).json({ error: 'kid es obligatorio' })
     return
   }
   const entry = tenantKeysByKid.get(kid)
@@ -256,6 +322,7 @@ app.post('/api/tokens/tenant', async (req, res) => {
     return
   }
 
+  const ttl = clampTtl(expiresInSec)
   const base = publicBaseUrl(req)
   const iss = `${base}/oem`
 
@@ -268,15 +335,16 @@ app.post('/api/tokens/tenant', async (req, res) => {
     .setAudience(entry.aud)
     .setSubject(sub)
     .setIssuedAt()
-    .setExpirationTime(`${Math.min(Math.max(Number(expiresInSec) || 300, 60), 3600)} sec`)
+    .setExpirationTime(`${ttl} sec`)
     .sign(entry.privateKey)
 
   res.json({
     token_type: 'Bearer',
     access_token: jwt,
-    expires_in: Math.min(Math.max(Number(expiresInSec) || 300, 60), 3600),
+    expires_in: ttl,
     scope: entry.scope,
     aud: entry.aud,
+    note: 'Incluye claim scope (no forma parte del contrato bootstrap); usar /api/tokens/bootstrap para oem-bootstrap',
   })
 })
 
@@ -287,6 +355,7 @@ app.use((_req, res) => {
 await initTenantKeys()
 
 app.listen(PORT, () => {
-  console.log(`Mock auth escuchando en http://localhost:${PORT}`)
-  console.log(`Definir MOCK_PUBLIC_URL si el emisor debe mostrar otra base URL (proxy TLS).`)
+  console.log(`OEM OIDC simulator http://localhost:${PORT}`)
+  console.log(`MOCK_PUBLIC_URL: URL pública si hay proxy/TLS`)
+  console.log(`OEM_PLATFORM_SERVICE_ACCOUNT_ID: aud JWT bootstrap (requerido salvo pasar aud en body)`)
 })
