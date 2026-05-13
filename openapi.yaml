@@ -1,0 +1,506 @@
+openapi: 3.0.3
+info:
+  title: OEM OIDC Simulator (TeamViewer)
+  description: |
+    OIDC/JWKS issuer simulator and **EdDSA (Ed25519)** JWT minting, aligned with the OEM OIDC Simulator contract (Applivery).
+
+    - **Discovery** and **JWKS** are public GET endpoints (consumed by Applivery when verifying tokens).
+    - `/api/*` routes are **simulator control plane** (workspace key registration and token minting).
+    - Token TTL: **maximum 300 s** (`MAX_TOKEN_TTL_SEC` in code).
+
+    Environment variables: `PORT`, `MOCK_PUBLIC_URL`, `OEM_PLATFORM_SERVICE_ACCOUNT_ID`, `OEM_BOOTSTRAP_TENANT_KID`.
+  version: 0.2.0
+
+servers:
+  - url: "{baseUrl}"
+    variables:
+      baseUrl:
+        default: http://localhost:3847
+        description: Simulator origin (use HTTPS and a real hostname in integration).
+
+tags:
+  - name: meta
+    description: Service status
+  - name: oidc
+    description: Discovery and JWKS (Applivery contract)
+  - name: admin
+    description: Workspace key registration (simulator)
+  - name: tokens
+    description: Test JWT minting
+
+paths:
+  /:
+    get:
+      tags: [meta]
+      summary: Simulator info
+      operationId: getRoot
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimulatorRootInfo"
+
+  /openapi.yaml:
+    get:
+      tags: [meta]
+      summary: OpenAPI specification (this document)
+      operationId: getOpenApiYaml
+      responses:
+        "200":
+          description: YAML document
+          content:
+            application/yaml:
+              schema:
+                type: string
+
+  /oem/.well-known/openid-configuration:
+    get:
+      tags: [oidc]
+      summary: OIDC discovery (root / tenant issuer)
+      description: |
+        `issuer` = `{baseUrl}/oem`. Applivery uses this document to resolve `jwks_uri`.
+      operationId: getTenantOpenIdConfiguration
+      responses:
+        "200":
+          description: Minimal document (`issuer` and `jwks_uri` only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OpenIdConfigurationMinimal"
+
+  /oem/.well-known/jwks.json:
+    get:
+      tags: [oidc]
+      summary: Root issuer JWKS
+      description: Ed25519 public keys to verify JWTs with `iss` `{baseUrl}/oem` (e.g. bootstrap).
+      operationId: getTenantJwks
+      responses:
+        "200":
+          description: JWKS
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Jwks"
+
+  /oem/{companyId}/.well-known/openid-configuration:
+    get:
+      tags: [oidc]
+      summary: OIDC discovery (workspace issuer)
+      description: |
+        `issuer` = `{baseUrl}/oem/{companyId}`. Must match `workspaceIssuer` stored at Applivery during bootstrap.
+      operationId: getWorkspaceOpenIdConfiguration
+      parameters:
+        - $ref: "#/components/parameters/CompanyId"
+      responses:
+        "200":
+          description: Minimal document
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OpenIdConfigurationMinimal"
+
+  /oem/{companyId}/.well-known/jwks.json:
+    get:
+      tags: [oidc]
+      summary: Workspace issuer JWKS
+      operationId: getWorkspaceJwks
+      parameters:
+        - $ref: "#/components/parameters/CompanyId"
+      responses:
+        "200":
+          description: JWKS (may contain multiple keys after rotation in the simulator)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Jwks"
+        "404":
+          description: No keys registered for this `companyId`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+
+  /api/customers/{companyId}/keys:
+    post:
+      tags: [admin]
+      summary: Register an Ed25519 key pair for a workspace
+      description: Generates `kid` and signing material in memory. Resulting `issuer` = `{baseUrl}/oem/{companyId}`.
+      operationId: postCustomerKeys
+      parameters:
+        - $ref: "#/components/parameters/CompanyId"
+      responses:
+        "201":
+          description: Key created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CustomerKeyCreated"
+        "400":
+          description: Empty `companyId`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+
+  /api/customers/{companyId}:
+    get:
+      tags: [admin]
+      summary: List registered `kid` values for a workspace
+      operationId: getCustomer
+      parameters:
+        - $ref: "#/components/parameters/CompanyId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CustomerSummary"
+        "404":
+          description: No keys
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+
+  /api/tokens/bootstrap:
+    post:
+      tags: [tokens]
+      summary: Mint bootstrap JWT (Applivery `oem-bootstrap`)
+      description: |
+        JWT claims: `iss`, `aud`, `sub`, `iat`, `exp`, `jti` (no `scope`).
+        `aud` = request body `aud` or `OEM_PLATFORM_SERVICE_ACCOUNT_ID` env var.
+        JWT header: `alg: EdDSA`, `kid`, `typ: JWT`.
+      operationId: postTokenBootstrap
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BootstrapMintRequest"
+      responses:
+        "200":
+          description: Token issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BootstrapTokenResponse"
+        "400":
+          description: Missing `aud` (env or body)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "404":
+          description: Unknown tenant `kid`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+
+  /api/tokens/customer:
+    post:
+      tags: [tokens]
+      summary: Mint workspace JWT (operator / owner)
+      description: |
+        For `https://<applivery-api>/v1/organizations/{organizationId}/...` with
+        `Authorization: Bearer` and `X-Applivery-Integration: oem`.
+
+        JWT payload includes `wid`, `uid`, `jti` plus standard claims (`iss`, `aud`, `sub`, `iat`, `exp`).
+      operationId: postTokenCustomer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CustomerMintRequest"
+      responses:
+        "200":
+          description: Token issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CustomerTokenResponse"
+        "400":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "404":
+          description: No keys for `companyId`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+
+  /api/tokens/tenant:
+    post:
+      tags: [tokens]
+      summary: Mint tenant JWT with `scope` claim (development only)
+      description: |
+        Illustrative TMV §3.5 extension. **Does not** replace `/api/tokens/bootstrap` for the Applivery contract.
+      operationId: postTokenTenantDev
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TenantMintRequest"
+      responses:
+        "200":
+          description: Token issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TenantTokenDevResponse"
+        "400":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "404":
+          description: Unknown `kid`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+
+components:
+  parameters:
+    CompanyId:
+      name: companyId
+      in: path
+      required: true
+      description: Workspace/company id in the simulator (URL segment of the issuer).
+      schema:
+        type: string
+        minLength: 1
+      example: acme-corp
+
+  schemas:
+    SimulatorRootInfo:
+      type: object
+      required: [service, ok, startedAt, maxTokenTtlSeconds, bootstrapTenantKid, platformServiceAccountIdConfigured]
+      properties:
+        service:
+          type: string
+          example: oem-oidc-simulator
+        ok:
+          type: boolean
+        openapi:
+          type: string
+          example: /openapi.yaml
+        startedAt:
+          type: string
+          format: date-time
+        maxTokenTtlSeconds:
+          type: integer
+          example: 300
+        bootstrapTenantKid:
+          type: string
+        platformServiceAccountIdConfigured:
+          type: boolean
+        hint:
+          type: string
+
+    ErrorBody:
+      type: object
+      properties:
+        error:
+          type: string
+        availableKids:
+          type: array
+          items:
+            type: string
+
+    OpenIdConfigurationMinimal:
+      type: object
+      required: [issuer, jwks_uri]
+      properties:
+        issuer:
+          type: string
+        jwks_uri:
+          type: string
+
+    Ed25519PublicJwk:
+      type: object
+      required: [kty, crv, kid, alg, use, x]
+      properties:
+        kty:
+          type: string
+          enum: [OKP]
+        crv:
+          type: string
+          enum: [Ed25519]
+        kid:
+          type: string
+        alg:
+          type: string
+          enum: [EdDSA]
+        use:
+          type: string
+          enum: [sig]
+        x:
+          type: string
+          description: Public coordinate (base64url)
+
+    Jwks:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/Ed25519PublicJwk"
+
+    CustomerKeyCreated:
+      type: object
+      required: [companyId, kid, issuer, jwks_uri]
+      properties:
+        companyId:
+          type: string
+        kid:
+          type: string
+        issuer:
+          type: string
+        jwks_uri:
+          type: string
+
+    CustomerSummary:
+      type: object
+      required: [companyId, issuer, keys]
+      properties:
+        companyId:
+          type: string
+        issuer:
+          type: string
+        keys:
+          type: array
+          items:
+            type: object
+            properties:
+              kid:
+                type: string
+
+    JwtHeaderEcho:
+      type: object
+      properties:
+        alg:
+          type: string
+          example: EdDSA
+        kid:
+          type: string
+        typ:
+          type: string
+          example: JWT
+
+    BootstrapMintRequest:
+      type: object
+      properties:
+        aud:
+          type: string
+        kid:
+          type: string
+        sub:
+          type: string
+          default: tmv-uem-simulator-admin
+        expiresInSec:
+          type: integer
+          minimum: 1
+          maximum: 300
+
+    BootstrapTokenResponse:
+      type: object
+      required: [token_type, access_token, expires_in, header, issuer, aud]
+      properties:
+        token_type:
+          type: string
+          enum: [Bearer]
+        access_token:
+          type: string
+        expires_in:
+          type: integer
+          maximum: 300
+        header:
+          $ref: "#/components/schemas/JwtHeaderEcho"
+        issuer:
+          type: string
+        aud:
+          type: string
+
+    CustomerMintRequest:
+      type: object
+      required: [companyId, wid, uid]
+      properties:
+        companyId:
+          type: string
+        wid:
+          type: string
+        uid:
+          type: string
+        sub:
+          type: string
+        aud:
+          type: string
+          default: applivery
+        expiresInSec:
+          type: integer
+          minimum: 1
+          maximum: 300
+        kid:
+          type: string
+
+    CustomerTokenResponse:
+      type: object
+      required: [token_type, access_token, expires_in, header, expected_issuer, note]
+      properties:
+        token_type:
+          type: string
+          enum: [Bearer]
+        access_token:
+          type: string
+        expires_in:
+          type: integer
+          maximum: 300
+        header:
+          $ref: "#/components/schemas/JwtHeaderEcho"
+        expected_issuer:
+          type: string
+        note:
+          type: string
+
+    TenantMintRequest:
+      type: object
+      required: [kid]
+      properties:
+        kid:
+          type: string
+          example: tmv-tenant-billing-2026-04
+        sub:
+          type: string
+        expiresInSec:
+          type: integer
+          minimum: 1
+          maximum: 300
+
+    TenantTokenDevResponse:
+      type: object
+      required: [token_type, access_token, expires_in, scope, aud, note]
+      properties:
+        token_type:
+          type: string
+          enum: [Bearer]
+        access_token:
+          type: string
+        expires_in:
+          type: integer
+        scope:
+          type: string
+        aud:
+          type: string
+        note:
+          type: string

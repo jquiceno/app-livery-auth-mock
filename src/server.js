@@ -1,22 +1,27 @@
 /**
- * Simulador OEM OIDC: discovery/JWKS mínimos + JWT EdDSA (Ed25519).
- * Contrato: OEM OIDC Simulator (Applivery) + tmv-proposal §3 donde aplica.
+ * OEM OIDC simulator: minimal discovery/JWKS + EdDSA (Ed25519) JWTs.
+ * Contract: OEM OIDC Simulator (Applivery); see tmv-proposal.md §3 where applicable.
  */
 import express from 'express'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { generateKeyPair, exportJWK, SignJWT } from 'jose'
 import { randomUUID } from 'node:crypto'
 
+const __dirname = dirname(fileURLToPath(import.meta.url))
+
 const PORT = Number(process.env.PORT ?? 3847)
 
-/** Audiencia para POST /admin/organizations/oem-bootstrap (valor que entrega Applivery). */
+/** Audience for Applivery POST /admin/organizations/oem-bootstrap (value provided by Applivery). */
 const OEM_PLATFORM_SERVICE_ACCOUNT_ID = process.env.OEM_PLATFORM_SERVICE_ACCOUNT_ID ?? ''
 
 const MOCK_PUBLIC_URL = (process.env.MOCK_PUBLIC_URL ?? '').replace(/\/$/, '')
 
-/** TTL máximo del contrato (segundos). */
+/** Max token TTL per contract (seconds). */
 const MAX_TOKEN_TTL_SEC = 300
 
-/** kid por defecto para firmar el JWT de bootstrap (clave workspace en JWKS tenant). */
+/** Default kid for bootstrap JWT signing (workspace key in tenant JWKS). */
 const BOOTSTRAP_TENANT_KID =
   process.env.OEM_BOOTSTRAP_TENANT_KID ?? 'tmv-tenant-workspace-2026-04'
 
@@ -106,21 +111,28 @@ app.get('/', (_req, res) => {
   res.json({
     service: 'oem-oidc-simulator',
     ok: true,
+    openapi: '/openapi.yaml',
     startedAt: new Date(startedAt).toISOString(),
     maxTokenTtlSeconds: MAX_TOKEN_TTL_SEC,
     bootstrapTenantKid: BOOTSTRAP_TENANT_KID,
     platformServiceAccountIdConfigured: Boolean(OEM_PLATFORM_SERVICE_ACCOUNT_ID),
     hint:
       !OEM_PLATFORM_SERVICE_ACCOUNT_ID &&
-      'Definir OEM_PLATFORM_SERVICE_ACCOUNT_ID con el valor de Applivery para /api/tokens/bootstrap',
+      'Set OEM_PLATFORM_SERVICE_ACCOUNT_ID to the value from Applivery for /api/tokens/bootstrap',
   })
 })
 
-/** Registra claves del emisor workspace: iss = …/oem/{companyId} (debe coincidir con workspaceIssuer del bootstrap). */
+/** OpenAPI 3 — file at repo root `openapi.yaml` */
+app.get('/openapi.yaml', (_req, res) => {
+  const specPath = join(__dirname, '..', 'openapi.yaml')
+  res.type('application/yaml').send(readFileSync(specPath, 'utf8'))
+})
+
+/** Register workspace issuer keys; iss = …/oem/{companyId} (must match bootstrap workspaceIssuer). */
 app.post('/api/customers/:companyId/keys', async (req, res) => {
   const { companyId } = req.params
   if (!companyId?.length) {
-    res.status(400).json({ error: 'companyId requerido' })
+    res.status(400).json({ error: 'companyId is required' })
     return
   }
   const { privateKey, publicKey } = await createEd25519Pair()
@@ -141,7 +153,9 @@ app.post('/api/customers/:companyId/keys', async (req, res) => {
 app.get('/api/customers/:companyId', (req, res) => {
   const list = customerKeys.get(req.params.companyId)
   if (!list?.length) {
-    res.status(404).json({ error: 'customer sin claves; POST /api/customers/:id/keys primero' })
+    res.status(404).json({
+      error: 'no keys for this customer; call POST /api/customers/:companyId/keys first',
+    })
     return
   }
   const base = publicBaseUrl(req)
@@ -152,7 +166,7 @@ app.get('/api/customers/:companyId', (req, res) => {
   })
 })
 
-/** Emisor raíz / tenant — discovery mínimo (contrato OEM OIDC Simulator). */
+/** Root / tenant issuer — minimal discovery (OEM OIDC Simulator contract). */
 app.get('/oem/.well-known/openid-configuration', (req, res) => {
   const base = publicBaseUrl(req)
   const issuer = `${base}/oem`
@@ -169,7 +183,7 @@ app.get('/oem/.well-known/jwks.json', async (_req, res) => {
   res.json({ keys })
 })
 
-/** Emisor por workspace/company — discovery mínimo. */
+/** Per-workspace/company issuer — minimal discovery. */
 app.get('/oem/:companyId/.well-known/openid-configuration', (req, res) => {
   const { companyId } = req.params
   const base = publicBaseUrl(req)
@@ -183,7 +197,9 @@ app.get('/oem/:companyId/.well-known/openid-configuration', (req, res) => {
 app.get('/oem/:companyId/.well-known/jwks.json', async (req, res) => {
   const list = customerKeys.get(req.params.companyId)
   if (!list?.length) {
-    res.status(404).json({ error: 'JWKS vacío: registrar claves con POST /api/customers/:companyId/keys' })
+    res.status(404).json({
+      error: 'empty JWKS; register keys via POST /api/customers/:companyId/keys',
+    })
     return
   }
   const keys = await Promise.all(list.map((k) => keyPairToJwksEntry(k.publicKey, k.kid)))
@@ -191,8 +207,8 @@ app.get('/oem/:companyId/.well-known/jwks.json', async (req, res) => {
 })
 
 /**
- * JWT workspace (operador / owner) para llamadas Applivery /v1 con ese issuer.
- * Claims: iss, aud, sub, wid, uid, iat, exp, jti — contrato + reglas importante.
+ * Workspace JWT (operator / owner) for Applivery /v1 calls with this issuer.
+ * Claims: iss, aud, sub, wid, uid, iat, exp, jti — contract + validation rules.
  */
 app.post('/api/tokens/customer', async (req, res) => {
   const {
@@ -206,13 +222,13 @@ app.post('/api/tokens/customer', async (req, res) => {
   } = req.body ?? {}
 
   if (!companyId || !wid || !uid) {
-    res.status(400).json({ error: 'companyId, wid y uid son obligatorios' })
+    res.status(400).json({ error: 'companyId, wid, and uid are required' })
     return
   }
 
   const list = customerKeys.get(companyId)
   if (!list?.length) {
-    res.status(404).json({ error: `sin claves para companyId=${companyId}` })
+    res.status(404).json({ error: `no keys registered for companyId=${companyId}` })
     return
   }
 
@@ -221,7 +237,7 @@ app.post('/api/tokens/customer', async (req, res) => {
     : list[list.length - 1]
 
   if (!entry) {
-    res.status(400).json({ error: `kid no encontrado: ${kidRequested}` })
+    res.status(400).json({ error: `kid not found: ${kidRequested}` })
     return
   }
 
@@ -249,20 +265,20 @@ app.post('/api/tokens/customer', async (req, res) => {
     header: { alg: 'EdDSA', kid: entry.kid, typ: 'JWT' },
     expected_issuer: iss,
     note:
-      'En Applivery, wid debe coincidir con el organizationId de la URL; iss con workspaceIssuer guardado.',
+      'Applivery expects wid to match the organizationId in the URL and iss to match the stored workspaceIssuer.',
   })
 })
 
 /**
- * JWT de bootstrap (POST /admin/organizations/oem-bootstrap en Applivery).
- * Claims estrictos: iss, aud, sub, iat, exp, jti — sin scope.
+ * Bootstrap JWT (Applivery POST /admin/organizations/oem-bootstrap).
+ * Strict claims: iss, aud, sub, iat, exp, jti — no scope.
  */
 app.post('/api/tokens/bootstrap', async (req, res) => {
   const aud = req.body?.aud ?? OEM_PLATFORM_SERVICE_ACCOUNT_ID
   if (!aud) {
     res.status(400).json({
       error:
-        'aud obligatorio: configura OEM_PLATFORM_SERVICE_ACCOUNT_ID o envía {"aud":"<platformServiceAccountId>"}',
+        'aud is required: set OEM_PLATFORM_SERVICE_ACCOUNT_ID or send {"aud":"<platformServiceAccountId>"}',
     })
     return
   }
@@ -271,7 +287,7 @@ app.post('/api/tokens/bootstrap', async (req, res) => {
   const entry = tenantKeysByKid.get(kidRequested)
   if (!entry) {
     res.status(404).json({
-      error: `kid tenant no encontrado: ${kidRequested}`,
+      error: `tenant kid not found: ${kidRequested}`,
       availableKids: [...tenantKeysByKid.keys()],
     })
     return
@@ -304,19 +320,19 @@ app.post('/api/tokens/bootstrap', async (req, res) => {
 })
 
 /**
- * JWT tenant con claim scope (solo desarrollo / propuesta TMV §3.5 ilustrativa).
- * Para bootstrap usa /api/tokens/bootstrap.
+ * Tenant JWT with scope claim (dev-only / illustrative TMV §3.5).
+ * For bootstrap use POST /api/tokens/bootstrap.
  */
 app.post('/api/tokens/tenant', async (req, res) => {
   const { kid, sub = 'tmv-uem-tenant-ops', expiresInSec = MAX_TOKEN_TTL_SEC } = req.body ?? {}
   if (!kid) {
-    res.status(400).json({ error: 'kid es obligatorio' })
+    res.status(400).json({ error: 'kid is required' })
     return
   }
   const entry = tenantKeysByKid.get(kid)
   if (!entry) {
     res.status(404).json({
-      error: 'kid de tenant no encontrado',
+      error: 'tenant kid not found',
       availableKids: [...tenantKeysByKid.keys()],
     })
     return
@@ -344,18 +360,23 @@ app.post('/api/tokens/tenant', async (req, res) => {
     expires_in: ttl,
     scope: entry.scope,
     aud: entry.aud,
-    note: 'Incluye claim scope (no forma parte del contrato bootstrap); usar /api/tokens/bootstrap para oem-bootstrap',
+    note:
+      'Includes scope claim (not part of bootstrap contract); use POST /api/tokens/bootstrap for oem-bootstrap',
   })
 })
 
 app.use((_req, res) => {
-  res.status(404).json({ error: 'ruta no encontrada' })
+  res.status(404).json({ error: 'route not found' })
 })
 
 await initTenantKeys()
 
 app.listen(PORT, () => {
-  console.log(`OEM OIDC simulator http://localhost:${PORT}`)
-  console.log(`MOCK_PUBLIC_URL: URL pública si hay proxy/TLS`)
-  console.log(`OEM_PLATFORM_SERVICE_ACCOUNT_ID: aud JWT bootstrap (requerido salvo pasar aud en body)`)
+  console.log(`OEM OIDC simulator listening at http://localhost:${PORT}`)
+  console.log(
+    'MOCK_PUBLIC_URL: set when the public base URL differs (e.g. reverse proxy / TLS termination)',
+  )
+  console.log(
+    'OEM_PLATFORM_SERVICE_ACCOUNT_ID: bootstrap JWT aud (required unless you pass aud in the request body)',
+  )
 })
